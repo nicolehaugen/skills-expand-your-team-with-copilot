@@ -5,11 +5,110 @@ MongoDB database configuration and setup for Mergington High School API
 from pymongo import MongoClient
 from argon2 import PasswordHasher
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+# Mock collection class for when MongoDB is not available
+class MockCollection:
+    def __init__(self, initial_data=None):
+        self._data = initial_data or {}
+    
+    def find(self, query=None):
+        if query is None:
+            for key, value in self._data.items():
+                yield {"_id": key, **value}
+        else:
+            # Simple query handling for day filter
+            for key, value in self._data.items():
+                if self._matches_query(value, query):
+                    yield {"_id": key, **value}
+    
+    def find_one(self, query):
+        if isinstance(query, dict) and "_id" in query:
+            item_id = query["_id"]
+            if item_id in self._data:
+                return {"_id": item_id, **self._data[item_id]}
+        return None
+    
+    def insert_one(self, document):
+        if "_id" in document:
+            item_id = document.pop("_id")
+            self._data[item_id] = document
+            return type('Result', (), {'acknowledged': True})()
+        return type('Result', (), {'acknowledged': False})()
+    
+    def update_one(self, query, update):
+        if isinstance(query, dict) and "_id" in query:
+            item_id = query["_id"]
+            if item_id in self._data:
+                if "$push" in update:
+                    for field, value in update["$push"].items():
+                        if field in self._data[item_id]:
+                            self._data[item_id][field].append(value)
+                        else:
+                            self._data[item_id][field] = [value]
+                if "$pull" in update:
+                    for field, value in update["$pull"].items():
+                        if field in self._data[item_id] and value in self._data[item_id][field]:
+                            self._data[item_id][field].remove(value)
+                return type('Result', (), {'modified_count': 1})()
+        return type('Result', (), {'modified_count': 0})()
+    
+    def count_documents(self, query=None):
+        return len(self._data)
+    
+    def _matches_query(self, value, query):
+        # Handle complex MongoDB query syntax
+        for field, condition in query.items():
+            if field == "schedule_details.days":
+                if "schedule_details" in value and "days" in value["schedule_details"]:
+                    if isinstance(condition, dict) and "$in" in condition:
+                        # Handle $in operator: check if any day in condition["$in"] is in value["schedule_details"]["days"]
+                        requested_days = condition["$in"]
+                        activity_days = value["schedule_details"]["days"]
+                        if not any(day in activity_days for day in requested_days):
+                            return False
+                    elif isinstance(condition, str):
+                        # Handle direct string comparison
+                        if condition not in value["schedule_details"]["days"]:
+                            return False
+                else:
+                    return False
+            elif field == "schedule_details.start_time":
+                if "schedule_details" in value and "start_time" in value["schedule_details"]:
+                    activity_start = value["schedule_details"]["start_time"]
+                    if isinstance(condition, dict) and "$gte" in condition:
+                        if activity_start < condition["$gte"]:
+                            return False
+                    elif isinstance(condition, str):
+                        if activity_start < condition:
+                            return False
+                else:
+                    return False
+            elif field == "schedule_details.end_time":
+                if "schedule_details" in value and "end_time" in value["schedule_details"]:
+                    activity_end = value["schedule_details"]["end_time"]
+                    if isinstance(condition, dict) and "$lte" in condition:
+                        if activity_end > condition["$lte"]:
+                            return False
+                    elif isinstance(condition, str):
+                        if activity_end > condition:
+                            return False
+                else:
+                    return False
+        return True
+
+# Try to connect to MongoDB, fallback to mock if not available
+try:
+    client = MongoClient('mongodb://localhost:27017/', serverSelectionTimeoutMS=1000)
+    # Test connection
+    client.admin.command('ping')
+    db = client['mergington_high']
+    activities_collection = db['activities']
+    teachers_collection = db['teachers']
+    print("Connected to MongoDB successfully")
+except Exception as e:
+    print(f"MongoDB connection failed: {e}")
+    print("Using mock database for development")
+    activities_collection = MockCollection()
+    teachers_collection = MockCollection()
 
 # Methods
 def hash_password(password):
@@ -21,14 +120,25 @@ def init_database():
     """Initialize database if empty"""
 
     # Initialize activities if empty
-    if activities_collection.count_documents({}) == 0:
-        for name, details in initial_activities.items():
-            activities_collection.insert_one({"_id": name, **details})
-            
-    # Initialize teacher accounts if empty
-    if teachers_collection.count_documents({}) == 0:
-        for teacher in initial_teachers:
-            teachers_collection.insert_one({"_id": teacher["username"], **teacher})
+    try:
+        if activities_collection.count_documents({}) == 0:
+            for name, details in initial_activities.items():
+                activities_collection.insert_one({"_id": name, **details})
+                
+        # Initialize teacher accounts if empty
+        if teachers_collection.count_documents({}) == 0:
+            for teacher in initial_teachers:
+                teachers_collection.insert_one({"_id": teacher["username"], **teacher})
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        # For mock collections, initialize directly
+        if hasattr(activities_collection, '_data'):
+            activities_collection._data = initial_activities.copy()
+        if hasattr(teachers_collection, '_data'):
+            teachers_data = {}
+            for teacher in initial_teachers:
+                teachers_data[teacher["username"]] = {k: v for k, v in teacher.items() if k != "username"}
+            teachers_collection._data = teachers_data
 
 # Initial database if empty
 initial_activities = {
@@ -163,6 +273,17 @@ initial_activities = {
         },
         "max_participants": 16,
         "participants": ["william@mergington.edu", "jacob@mergington.edu"]
+    },
+    "Manga Maniacs": {
+        "description": "Explore the fantastic stories of the most interesting characters from Japanese Manga (graphic novels).",
+        "schedule": "Tuesdays, 7:00 PM - 8:30 PM",
+        "schedule_details": {
+            "days": ["Tuesday"],
+            "start_time": "19:00",
+            "end_time": "20:30"
+        },
+        "max_participants": 15,
+        "participants": []
     }
 }
 
